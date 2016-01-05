@@ -132,11 +132,12 @@ smart_trainer = function(model, criterion,
         input_data, n_classes,
         batch_size, cv_split, class_train, max_epochs, 
         optimizer, optimizer_params, 
-        l1, l2, chart)
+        l1, l2, chart, save_prefix)
     local in_itorch = true
     if itorch._iopub == nil then
         in_itorch = false
     end
+    local loss_multiplier = 1 / optimizer_params.learningRate
     local training_loss_history = {}
     local validation_loss_history = {}
     irregularloss = {}
@@ -175,6 +176,7 @@ smart_trainer = function(model, criterion,
         local window = itorch.html(old_text)
     end
     local disp = require 'display'
+    local best_val = 1e10
     while true do
         model:training()
         if class_train then
@@ -200,6 +202,7 @@ smart_trainer = function(model, criterion,
 	     else
 		for i=1,#irregularloss do  thisLoss = thisLoss + irregularloss[i] end
             end
+	     thisLoss = thisLoss * loss_multiplier
             currentError = ((currentError * batch_index) + (thisLoss * batch_size)) / (batch_index + batch_size)
             if in_itorch then 
                 local percCompl = math.floor(50 * batch_index / max_idx)
@@ -210,8 +213,8 @@ smart_trainer = function(model, criterion,
                         string.rep(".", 49 - percCompl ) .. '] ETA: %d seconds - Batch Loss: %.6f - Avg. Epoch Loss: %.6f<br>', 
                             batch_index, input_data:size(), 
                             eta, 
-                            thisLoss * batch_size, 
-                            currentError * batch_size
+                            thisLoss, 
+                            currentError
                     ),
                     window) 
             else
@@ -229,17 +232,25 @@ smart_trainer = function(model, criterion,
             local prediction = model:forward(inputs, targets)
             local losses = criterion:forward(prediction, targets)
             if type(losses) == 'number' then
-                validation_loss = validation_loss + losses
+                validation_loss = validation_loss + (losses * math.min(batch_size, 
+                    					input_data:size() - batch_index - 1))
             else
                 for i=1,#losses do validation_loss = validation_loss + losses[i] end
             end
         end
+	 validation_loss = loss_multiplier * validation_loss / (input_data:size() - max_idx)
+	 if validation_loss < best_val then
+		torch.save(string.format(save_prefix .. 'batch_%d_lr_%.4f_epoch_%d_val_%.5f_.t7', 
+			batch_size, optimizer_params.learningRate, epoch, validation_loss), 
+			model, 'binary')
+		best_val = validation_loss
+	 end
         table.insert(validation_loss_history, validation_loss)
         -- report update
         if in_itorch then
             old_text = old_text .. string.format('Epoch %d completed in %d seconds with training avg loss %.8f - ' ..
                                                     'Val loss %.8f.<br>', 
-                        epoch, os.time() - startTime, currentError * 100, validation_loss)
+                        epoch, os.time() - startTime, currentError, validation_loss)
             itorch.html(old_text,
                     window)
             if chart then 
@@ -256,7 +267,7 @@ smart_trainer = function(model, criterion,
         else
             print(string.format('Epoch %d completed in %d seconds with training avg loss %.8f - ' ..
                                                     'Val loss %.8f.', 
-                        epoch, os.time() - startTime, currentError * 100, validation_loss))
+                        epoch, os.time() - startTime, currentError, validation_loss))
             if chart then
 		 local chart_data = torch.DoubleTensor(epoch, 3)
 		 for i=1,epoch do 
@@ -272,7 +283,9 @@ smart_trainer = function(model, criterion,
 		     xrangepad = 30,
 		     digitsafterdecimal = 8,
 		     labels = {'epoch', 'training', 'validation'},
-                    useInteractiveGuideline = true
+		     legend = 'always',
+                    useInteractiveGuideline = true,
+		     title = string.format('Batch size %d, l1 %.4f, l2 %.4f, lr %.4f', batch_size, l1, l2, optimizer_params.learningRate)
                 }
 		 if win ~= nil then
 			chart_config['win'] = win
@@ -287,6 +300,6 @@ smart_trainer = function(model, criterion,
 end
 smart_trainer(ntm, loss_out,
         input_data, nil,
-        5000, 0.2, false, 1000, 
+        1000, 0.2, false, 1000, 
         optim.sgd, {learningRate = 0.01}, 
-        0, 0.001, true)
+        0, 0.001, true, 'sess1_')
