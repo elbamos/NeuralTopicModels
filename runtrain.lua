@@ -85,31 +85,45 @@ input_meta = {
 }
 
 input_data = {
-    g = examples:index(2, torch.LongTensor{2}), 
-    d = examples:index(2, torch.LongTensor{1,3}),
+    g = examples:select(2,2), 
+    d = torch.cat(
+        examples[{{1, examples:size()[1]},  {1}}], 
+	 examples[{{1, examples:size()[1]}, {3, examples:size()[2]}}]),
+    colindex = 0,
     size = function (self) 
-        return self.g:size()[1] 
+        return self.g:size()[1]
     end,
     shuffle = function (self, len)
         self.shuffledIndices = torch.randperm(self.g:size()[1], 'torch.LongTensor')
         self.batchIndex = 1
-        self.g_batch = torch.DoubleTensor(len, self.g:size()[2])
-        self.d_batch = torch.DoubleTensor(len, self.d:size()[2])
+	 self.colindex = (self.colindex + 1) % (self.d:size()[2])
+	 if self.colindex == 0 then
+		self.colindex = 1
+	 end
+
+        self.g_batch = torch.DoubleTensor(len, 1)
+        self.d_batch = torch.DoubleTensor(len, 2)
+
+	 if colindex == 1 then 
+		self.d_view = self.d[{{1, self.d:size()[1]},{1,2}}]
+	 else
+		self.d_view = torch.cat(  self.d[{{1, self.d:size()[1]},{1}}], 
+					   self.d[{{1, self.d:size()[1]},{self.colindex + 1}}]  ) 
+	 end
         
         self.t_batch = torch.DoubleTensor(len, 1):fill(-1)
         return {self.g_batch, self.d_batch}, self.t_batch
     end,
     next_batch = function (self, len) 
-        local maxidx = math.min(self.batchIndex + len - 1, self:size())
+        local maxidx = math.min(self.batchIndex + len - 1, self.d:size()[1])
         local batchindices = self.shuffledIndices[{{self.batchIndex, maxidx}}]
---        return {self.g:index(1, batchindices, 
---                self.d:index(1, batchindices))}
+
         self.g_batch:index(self.g, 1, batchindices)
-        self.d_batch:index(self.d, 1, batchindices)
+        self.d_batch:index(self.d_view, 1, batchindices)
+
         self.batchIndex = self.batchIndex + len
         return {self.g_batch, self.d_batch}, self.t_batch
-                --{self.g[{{self.batchIndex - len, self.batchIndex}}],
-               -- self.d[{{self.batchIndex - len, self.batchIndex}}]}
+
     end
 }
 setmetatable(input_data, input_meta)
@@ -225,7 +239,7 @@ smart_trainer = function(model, criterion,
         if in_itorch then
             old_text = old_text .. string.format('Epoch %d completed in %d seconds with training avg loss %.8f - ' ..
                                                     'Val loss %.8f.<br>', 
-                        epoch, os.time() - startTime, currentError, validation_loss)
+                        epoch, os.time() - startTime, currentError * 100, validation_loss)
             itorch.html(old_text,
                     window)
             if chart then 
@@ -242,7 +256,7 @@ smart_trainer = function(model, criterion,
         else
             print(string.format('Epoch %d completed in %d seconds with training avg loss %.8f - ' ..
                                                     'Val loss %.8f.', 
-                        epoch, os.time() - startTime, currentError, validation_loss))
+                        epoch, os.time() - startTime, currentError * 100, validation_loss))
             if chart then
 		 local chart_data = torch.DoubleTensor(epoch, 3)
 		 for i=1,epoch do 
@@ -258,8 +272,7 @@ smart_trainer = function(model, criterion,
 		     xrangepad = 30,
 		     digitsafterdecimal = 8,
 		     labels = {'epoch', 'training', 'validation'},
-                    useInteractiveGuideline = true,
-		     logscale=true
+                    useInteractiveGuideline = true
                 }
 		 if win ~= nil then
 			chart_config['win'] = win
@@ -274,6 +287,6 @@ smart_trainer = function(model, criterion,
 end
 smart_trainer(ntm, loss_out,
         input_data, nil,
-        10000, 0.2, false, 500, 
+        5000, 0.2, false, 1000, 
         optim.sgd, {learningRate = 0.01}, 
         0, 0.001, true)
