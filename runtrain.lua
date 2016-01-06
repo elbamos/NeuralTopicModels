@@ -75,7 +75,7 @@ ls_neg:annotate({name = 'ls_neg'})
 
 ntm = nn.gModule({g, din}, {ls_pos, ls_neg})
 
-loss_out = nn.L1HingeEmbeddingCriterion(0.5):cuda()
+loss_out = nn.MarginRankingCriterion(0.5):cuda()
 ntm:cuda();
 input_meta = {
     __index = function( self, k ) 
@@ -111,8 +111,8 @@ input_data = {
 					   self.d[{{1, self.d:size()[1]},{self.colindex + 1}}]  ) 
 	 end
         
-        self.t_batch = torch.DoubleTensor(len, 1):fill(-1)
-        return {self.g_batch, self.d_batch}, self.t_batch
+        self.t_batch = torch.CudaTensor(len, 1):fill(1)
+        return {self.g_batch, self.d_batch}, 1
     end,
     next_batch = function (self, len) 
         local maxidx = math.min(self.batchIndex + len - 1, self.d:size()[1])
@@ -122,7 +122,7 @@ input_data = {
         self.d_batch:index(self.d_view, 1, batchindices)
 
         self.batchIndex = self.batchIndex + len
-        return {self.g_batch, self.d_batch}, self.t_batch
+        return {self.g_batch, self.d_batch}, 1
 
     end
 }
@@ -137,25 +137,17 @@ smart_trainer = function(model, criterion,
     if itorch._iopub == nil then
         in_itorch = false
     end
-    local loss_multiplier = 1 / optimizer_params.learningRate
     local training_loss_history = {}
     local validation_loss_history = {}
-    irregularloss = {}
     local function feval(x_in)
         local prediction = model:forward(inputs, targets)
-        local losses = criterion:forward(prediction, targets)
+        local loss = criterion:forward(prediction, targets)
         gradients:zero()
         local df = criterion:backward(prediction, targets)
         model:backward(inputs, df)
         -- regularize
         local norm,sign = torch.norm, torch.sign
-        local loss = 0
-        if type(losses) == 'number' then
-            loss = losses
-        else
-            for i=1,#losses do loss = loss + losses[i] end
-        end
-	 irregularloss = loss
+	 irregularloss = torch.sum(loss)
         if l1 ~= 0 then
             loss = loss + l1 * norm(x, 1)
             gradients:add(sign(x):mul(l1))
@@ -177,7 +169,12 @@ smart_trainer = function(model, criterion,
     end
     local disp = require 'display'
     local best_val = 1e10
-    while true do
+    local logger = optim.Logger(save_prefix .. '.log', true)
+    local weightLogger = optim.Logger('weights.log', true)
+    local allLogger = optim.Logger('all.log', false)
+    logger:setNames({'training loss', 'validation loss'})
+    weightLogger:setNames({'lt mean', 'lt var', 'ld mean', 'ld var'})
+     while true do
         model:training()
         if class_train then
             train_confusion = optim.ConfusionMatrix(n_classes)
@@ -196,14 +193,8 @@ smart_trainer = function(model, criterion,
             collectgarbage()
             inputs, targets = input_data:next_batch(math.min(batch_size, max_idx - batch_index - 1))
             _, f_table = optimizer(feval, x, optimizer_params)
-            local thisLoss = 0
-            if type(irregularloss) == 'number' then
-		thisLoss = thisLoss + irregularloss
-	     else
-		for i=1,#irregularloss do  thisLoss = thisLoss + irregularloss[i] end
-            end
-	     thisLoss = thisLoss * loss_multiplier
-            currentError = ((currentError * batch_index) + (thisLoss * batch_size)) / (batch_index + batch_size)
+            local thisLoss = irregularloss
+            currentError = ((currentError * batch_index) + (thisLoss)) / (batch_index + batch_size)
             if in_itorch then 
                 local percCompl = math.floor(50 * batch_index / max_idx)
                 local eta = ((os.time() - startTime) / (percCompl / 50)) - (os.time() - startTime)
@@ -235,64 +226,36 @@ smart_trainer = function(model, criterion,
                 validation_loss = validation_loss + (losses * math.min(batch_size, 
                     					input_data:size() - batch_index - 1))
             else
-                for i=1,#losses do validation_loss = validation_loss + losses[i] end
+                validation_loss = validation_loss + torch.sum(losses) 
             end
         end
-	 validation_loss = loss_multiplier * validation_loss / (input_data:size() - max_idx)
+	 validation_loss = validation_loss / (input_data:size() - max_idx)
 	 if validation_loss < best_val then
-		torch.save(string.format(save_prefix .. 'batch_%d_lr_%.4f_epoch_%d_val_%.5f_.t7', 
-			batch_size, optimizer_params.learningRate, epoch, validation_loss), 
-			model, 'binary')
+		local filename = string.format(save_prefix .. 'batch_%d_lr_%.4f_epoch_%d_val_%.5f_.t7', 
+			batch_size, optimizer_params.learningRate, epoch, validation_loss)
+		torch.save(filename, model, 'binary')
+		print(string.format('Achieved best val loss %.6f on epoch %d, saved as ', validation_loss, epoch) ..
+			filename)
 		best_val = validation_loss
 	 end
         table.insert(validation_loss_history, validation_loss)
+
+	logger:add({currentError, validation_loss})
+	if (epoch - 1) % 10 == 0 then
+		local lt_weights =  model:get(2):get(3).weight
+		local lt_mean = torch.mean(lt_weights)
+		local lt_var = torch.std(lt_weights)
+		local ld_weights = model:get(4):get(1).weight
+		local ld_mean = torch.mean(ld_weights)
+		local ld_var = torch.std(ld_weights)
+		weightLogger:add({lt_mean, lt_var, ld_mean, ld_var})
+		weightLogger:plot()
+	end
         -- report update
-        if in_itorch then
-            old_text = old_text .. string.format('Epoch %d completed in %d seconds with training avg loss %.8f - ' ..
-                                                    'Val loss %.8f.<br>', 
-                        epoch, os.time() - startTime, currentError, validation_loss)
-            itorch.html(old_text,
-                    window)
-            if chart then 
-                plot = Plot()
-                local x_vals = torch.linspace(1,epoch + 10)
-                plot:line(x_vals, training_loss_history, 
-                    'red', 'Training Loss')
-                plot:line(x_vals, validation_loss_history, 
-                    'blue', 'Validation Loss')
-                plot:xaxis('Training vs Validation Loss')
-                plot:legend(true)
-                plot:gfx()
-            end
-        else
-            print(string.format('Epoch %d completed in %d seconds with training avg loss %.8f - ' ..
+        print(string.format('Epoch %d completed in %d seconds with training avg loss %.8f - ' ..
                                                     'Val loss %.8f.', 
                         epoch, os.time() - startTime, currentError, validation_loss))
-            if chart then
-		 local chart_data = torch.DoubleTensor(epoch, 3)
-		 for i=1,epoch do 
-			chart_data[{i,1}] = i 
-			chart_data[{i,2}] = training_loss_history[i]
-			chart_data[{i,3}] = validation_loss_history[i]
-		 end
-                local chart_config = {
-                    chart = 'line',
-                    width = 600,
-                    height = 400,
-                    ylabel = 'loss',
-		     xrangepad = 30,
-		     digitsafterdecimal = 8,
-		     labels = {'epoch', 'training', 'validation'},
-		     legend = 'always',
-                    useInteractiveGuideline = true,
-		     title = string.format('Batch size %d, l1 %.4f, l2 %.4f, lr %.4f', batch_size, l1, l2, optimizer_params.learningRate)
-                }
-		 if win ~= nil then
-			chart_config['win'] = win
-		 end
-                win = disp.plot(chart_data, chart_config)
-            end
-        end
+	logger:plot()
         if max_epochs and epoch >= max_epochs then
             break
         end
@@ -300,6 +263,6 @@ smart_trainer = function(model, criterion,
 end
 smart_trainer(ntm, loss_out,
         input_data, nil,
-        1000, 0.2, false, 1000, 
+        20000, 0.2, false, 1000, 
         optim.sgd, {learningRate = 0.01}, 
-        0, 0.001, true, 'sess1_')
+        0, 0, true, 'fix1_batch20000_lr01_l2000Õ)
