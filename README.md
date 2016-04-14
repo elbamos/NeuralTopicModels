@@ -1,6 +1,6 @@
 # NeuralTopicModels
 
-This repo contains a WIP implementation of http://nlp.cs.rpi.edu/paper/AAAI15.pdf
+This repo contains a WIP implementation of http://nlp.cs.rpi.edu/paper/AAAI15.pdf.  This is here for the purpose of sharing with collaborators -- it isn't final code or presentation-quality code.  
 
 The NTM model is intended to work essentially as follows:
 
